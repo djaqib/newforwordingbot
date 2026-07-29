@@ -16,7 +16,6 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
-
 logger = logging.getLogger(__name__)
 
 # ---------------------- REDIS (Persistent Dedup) ----------------------
@@ -24,13 +23,13 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 r = redis.Redis.from_url(REDIS_URL)
 
 # ---------------------- SETTINGS ----------------------
-PHOTO_ACCEPT = True          # toggle ON/OFF for photos
-BATCH_TIMEOUT = 120          # seconds for video batch timeout
-ALBUM_MIN_COUNT = 10         # send album when >= 10 videos
+PHOTO_ACCEPT = True
+BATCH_TIMEOUT = 120
+ALBUM_MIN_COUNT = 10
 
 # ---------------------- ALBUM BUFFER + TIMER ----------------------
-album_buffer = {}            # chat_id -> list of file paths
-album_timer = {}             # chat_id -> asyncio.Task
+album_buffer = {}      # chat_id → list of file paths
+album_timer = {}       # chat_id → asyncio.Task
 
 
 # ---------------------- FLUSH ALBUM ----------------------
@@ -50,7 +49,7 @@ async def flush_album(chat_id: int, bot):
     if media_group:
         await bot.send_media_group(chat_id=chat_id, media=media_group)
 
-    # Cleanup files
+    # Cleanup
     for fp in album_buffer[chat_id]:
         try:
             os.remove(fp)
@@ -60,7 +59,7 @@ async def flush_album(chat_id: int, bot):
     album_buffer[chat_id] = []
 
 
-# ---------------------- START ALBUM TIMER ----------------------
+# ---------------------- START TIMER ----------------------
 async def start_album_timer(chat_id: int, bot):
     """Start a BATCH_TIMEOUT-second timer for album flush."""
     try:
@@ -108,7 +107,6 @@ async def clean_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
         media_type = "document"
 
     else:
-        # Text or other non-media → send clean text
         if msg.text:
             await context.bot.send_message(chat_id, msg.text)
         return
@@ -122,7 +120,7 @@ async def clean_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
         r.sadd("dedup", file_unique_id)
 
     # ---------------------- DOWNLOAD FILE ----------------------
-    file_path = f"temp_{file_unique_id}.bin" if file_unique_id else "temp.bin"
+    file_path = f"temp_{file_unique_id}.bin"
     try:
         await file_obj.get_file().download_to_drive(file_path)
     except Exception as e:
@@ -188,7 +186,6 @@ async def main():
 
     app = ApplicationBuilder().token(token).build()
 
-    # Handlers
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, clean_forward))
     app.add_handler(CommandHandler("togglephotos", toggle_photos))
 
@@ -196,5 +193,6 @@ async def main():
     await app.run_polling()
 
 
+# ---------------------- EVENT LOOP (Railway-safe) ----------------------
 if __name__ == "__main__":
     asyncio.run(main())
