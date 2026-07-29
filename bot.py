@@ -8,13 +8,13 @@ from telegram.ext import (
     MessageHandler,
     CommandHandler,
     ContextTypes,
-    filters
+    filters,
 )
 
 # ---------------------- LOGGING ----------------------
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
@@ -23,13 +23,13 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 r = redis.Redis.from_url(REDIS_URL)
 
 # ---------------------- SETTINGS ----------------------
-PHOTO_ACCEPT = True
-BATCH_TIMEOUT = 120
-ALBUM_MIN_COUNT = 10
+PHOTO_ACCEPT = True          # togglephotos command controls this
+BATCH_TIMEOUT = 120          # seconds before flushing partial album
+ALBUM_MIN_COUNT = 10         # send immediately when this many videos collected
 
 # ---------------------- ALBUM BUFFER + TIMER ----------------------
-album_buffer = {}      # chat_id → list of file paths
-album_timer = {}       # chat_id → asyncio.Task
+album_buffer: dict[int, list[str]] = {}   # chat_id → list of file paths
+album_timer: dict[int, asyncio.Task] = {} # chat_id → asyncio.Task
 
 
 # ---------------------- FLUSH ALBUM ----------------------
@@ -178,7 +178,7 @@ async def toggle_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Photo acceptance is now {status}.")
 
 
-# ---------------------- MAIN APP (PTB lifecycle with shutdown fix) ----------------------
+# ---------------------- MAIN APP (PTB v20 lifecycle with run_polling) ----------------------
 async def main():
     token = os.getenv("BOT_TOKEN")
     if not token:
@@ -193,13 +193,10 @@ async def main():
 
     await app.initialize()
     await app.start()
-    await app.updater.start_polling()
-
-    try:
-        await app.updater.idle()
-    finally:
-        await app.stop()
-        await app.shutdown()
+    # Single, correct PTB v20 entrypoint: handles polling + idle + shutdown
+    await app.run_polling()
+    await app.stop()
+    await app.shutdown()
 
 
 # ---------------------- EVENT LOOP (Railway-safe) ----------------------
