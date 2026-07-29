@@ -72,19 +72,27 @@ async def clean_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_id = None
     media_type = None
 
-    # Normal Telegram video
+    # ---------------------- VIDEO DETECTION ----------------------
+
+    # Case 1: Normal Telegram video
     if msg.video:
         file_unique_id = msg.video.file_unique_id
         file_id = msg.video.file_id
         media_type = "video"
 
-    # iPhone MP4 or forwarded MP4 (video sent as document)
+    # Case 2: Document with video mime type (iPhone MP4, some forwards)
     elif msg.document and msg.document.mime_type and msg.document.mime_type.startswith("video"):
         file_unique_id = msg.document.file_unique_id
         file_id = msg.document.file_id
         media_type = "video"
 
-    # Photo
+    # Case 3: Forwarded videos from bots/channels (octet-stream)
+    elif msg.document and msg.document.file_name and msg.document.file_name.lower().endswith(".mp4"):
+        file_unique_id = msg.document.file_unique_id
+        file_id = msg.document.file_id
+        media_type = "video"
+
+    # ---------------------- PHOTO ----------------------
     elif msg.photo:
         if not PHOTO_ACCEPT:
             await context.bot.send_message(chat_id, "Photo dropped (disabled).")
@@ -94,7 +102,7 @@ async def clean_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_id = msg.photo[-1].file_id
         media_type = "photo"
 
-    # Document (non-video)
+    # ---------------------- DOCUMENT (non-video) ----------------------
     elif msg.document:
         file_unique_id = msg.document.file_unique_id
         file_id = msg.document.file_id
@@ -105,7 +113,7 @@ async def clean_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id, msg.text)
         return
 
-    # Dedup
+    # ---------------------- DEDUP ----------------------
     if file_unique_id and r.sismember("dedup", file_unique_id):
         await context.bot.send_message(chat_id, "Duplicate ignored.")
         return
@@ -113,14 +121,14 @@ async def clean_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if file_unique_id:
         r.sadd("dedup", file_unique_id)
 
-    # ---------------------- VIDEO ALBUM MODE (file_id only) ----------------------
+    # ---------------------- VIDEO ALBUM MODE ----------------------
     if media_type == "video":
         if chat_id not in album_buffer:
             album_buffer[chat_id] = []
 
         album_buffer[chat_id].append(file_id)
 
-        # If >= ALBUM_MIN_COUNT → send immediately
+        # Flush immediately if enough videos
         if len(album_buffer[chat_id]) >= ALBUM_MIN_COUNT:
             await flush_album(chat_id, context.bot)
 
@@ -138,7 +146,7 @@ async def clean_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return
 
-    # ---------------------- NON-VIDEO MEDIA (file_id only) ----------------------
+    # ---------------------- NON-VIDEO MEDIA ----------------------
     if media_type == "photo":
         await context.bot.send_photo(chat_id, file_id)
 
@@ -169,7 +177,7 @@ async def main():
 
     await app.initialize()
     await app.start()
-    await app.run_polling()   # <-- Correct PTB v20 lifecycle
+    await app.run_polling()
     await app.stop()
     await app.shutdown()
 
