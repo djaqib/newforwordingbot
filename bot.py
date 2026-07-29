@@ -122,7 +122,8 @@ async def clean_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ---------------------- DOWNLOAD FILE ----------------------
     file_path = f"temp_{file_unique_id}.bin"
     try:
-        await file_obj.get_file().download_to_drive(file_path)
+        tg_file = await file_obj.get_file()
+        await tg_file.download_to_drive(file_path)
     except Exception as e:
         logger.error(f"Error downloading file: {e}")
         await context.bot.send_message(chat_id, "Error processing file.")
@@ -179,7 +180,7 @@ async def toggle_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------- MAIN APP (PTB v20 lifecycle with run_polling) ----------------------
-async def main():
+def main():
     token = os.getenv("BOT_TOKEN")
     if not token:
         raise RuntimeError("BOT_TOKEN environment variable is not set.")
@@ -191,14 +192,14 @@ async def main():
 
     logger.info("Bot starting...")
 
-    await app.initialize()
-    await app.start()
-    # Single, correct PTB v20 entrypoint: handles polling + idle + shutdown
-    await app.run_polling()
-    await app.stop()
-    await app.shutdown()
+    # run_polling() is synchronous and self-contained: it calls
+    # initialize(), start(), polls for updates, idles, and shuts down
+    # for you. Do not wrap it in asyncio.run() or await it, and do not
+    # call app.initialize()/app.start()/app.shutdown() yourself —
+    # doing so causes the "Updater is still running" crash loop.
+    app.run_polling()
 
 
-# ---------------------- EVENT LOOP (Railway-safe) ----------------------
+# ---------------------- ENTRYPOINT (Railway-safe) ----------------------
 if __name__ == "__main__":
-    asyncio.run(main(), debug=False)
+    main()
