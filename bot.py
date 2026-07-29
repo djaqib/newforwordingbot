@@ -1,206 +1,294 @@
-import logging
 import os
-import redis
+import logging
 import asyncio
-from telegram import Update, InputMediaVideo
+import random
+import time
+from telegram import Update, InputMediaVideo, BotCommand
 from telegram.ext import (
-    ApplicationBuilder,
-    MessageHandler,
-    CommandHandler,
-    ContextTypes,
-    filters,
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    ContextTypes, filters
 )
 
-# ---------------------- LOGGING ----------------------
+# -----------------------------
+# Logging
+# -----------------------------
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("bot.log"),
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
 
-# ---------------------- YOUR CHAT ID (for error reports) ----------------------
-ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))  # set in Railway variables
+# -----------------------------
+# Admin IDs (ONLY these users can use bot)
+# -----------------------------
+ADMIN_IDS = [
+    7599601301,  # KR
+    8637601933,
+    8976017144,
+]
 
-# ---------------------- REDIS ----------------------
-REDIS_URL = os.getenv("REDIS_URL")
-r = redis.Redis.from_url(REDIS_URL)
+# -----------------------------
+# Global State
+# -----------------------------
+video_cache = set()
+photo_approval_mode = False
+batch_count = 0
+last_video_time = 0
+FLUSH_TIMEOUT = 60  # seconds
 
-# ---------------------- SETTINGS ----------------------
-PHOTO_ACCEPT = True
-BATCH_TIMEOUT = 120
-ALBUM_MIN_COUNT = 10
 
-album_buffer: dict[int, list[str]] = {}
-album_timer: dict[int, asyncio.Task] = {}
+# -----------------------------
+# Admin-only decorator
+# -----------------------------
+def admin_only(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if user_id not in ADMIN_IDS:
+            await update.message.reply_text("This bot is private. Access denied.")
+            return
+        return await func(update, context)
+    return wrapper
 
-# ---------------------- SAFE SEND WRAPPER ----------------------
-async def safe_send(bot_method, *args, **kwargs):
-    try:
-        return await bot_method(*args, **kwargs)
-    except Exception as e:
-        logger.error(f"Telegram API error: {e}")
-        if ADMIN_CHAT_ID:
-            await bot_method.__self__.send_message(
-                ADMIN_CHAT_ID,
-                f"⚠️ Telegram API error:\n{e}"
-            )
-        return None
 
-# ---------------------- FLUSH ALBUM ----------------------
-async def flush_album(chat_id: int, bot):
-    if chat_id not in album_buffer or len(album_buffer[chat_id]) == 0:
+# -----------------------------
+# Commands (Admins only)
+# -----------------------------
+@admin_only
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"Bot ready.\nYour Telegram ID is: {update.effective_user.id}"
+    )
+
+
+@admin_only
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "Available commands:\n"
+        "/start – Show your Telegram ID\n"
+        "/help – Show this help menu\n"
+        "/settings – Show bot settings\n"
+        "/admin_commands – Show admin commands\n"
+        "/toggle_photo_mode – Toggle photo approval mode\n"
+        "/approve – Approve pending photo\n"
+        "/reject – Reject pending photo\n"
+        "/flush – Flush remaining videos\n"
+    )
+    await update.message.reply_text(text)
+
+
+@admin_only
+async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "Settings:\n"
+        f"Photo approval mode: {'ON' if photo_approval_mode else 'OFF'}\n"
+        f"Batch timeout: {FLUSH_TIMEOUT} seconds\n"
+        "Album size: 10 videos\n"
+    )
+    await update.message.reply_text(text)
+
+
+@admin_only
+async def admin_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    commands = [
+        "/toggle_photo_mode – Enable/disable photo approval mode",
+        "/approve – Approve pending photo",
+        "/reject – Reject pending photo",
+        "/flush – Manually flush remaining videos",
+        "/admin_commands – Show admin commands"
+    ]
+    text = "Admin commands:\n\n" + "\n".join(commands)
+    await update.message.reply_text(text)
+
+
+@admin_only
+async def toggle_photo_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global photo_approval_mode
+    photo_approval_mode = not photo_approval_mode
+    status = "ON" if photo_approval_mode else "OFF"
+    await update.message.reply_text(f"Photo approval mode is now {status}")
+
+
+@admin_only
+async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    file_id = context.user_data.get("pending_photo")
+    if not file_id:
+        await update.message.reply_text("No pending photo.")
         return
 
-    logger.info(f"Flushing album with {len(album_buffer[chat_id])} videos")
+    await update.message.reply_photo(file_id)
+    context.user_data["pending_photo"] = None
 
-    media_group = [InputMediaVideo(fid) for fid in album_buffer[chat_id]]
 
-    await safe_send(bot.send_media_group, chat_id, media_group)
+@admin_only
+async def reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["pending_photo"] = None
+    await update.message.reply_text("Photo rejected.")
 
-    album_buffer[chat_id] = []
 
-# ---------------------- ALBUM TIMER ----------------------
-async def start_album_timer(chat_id: int, bot):
+@admin_only
+async def flush(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    album = context.user_data.get("album", [])
+    if not album:
+        await update.message.reply_text("No pending videos.")
+        return
+
+    await send_album(update, context)
+    await update.message.reply_text("Flushed remaining videos.")
+
+
+# -----------------------------
+# Photo Handler (Admins only)
+# -----------------------------
+@admin_only
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global photo_approval_mode
+
+    file_id = update.message.photo[-1].file_id
+
+    if not photo_approval_mode:
+        await update.message.reply_photo(file_id)
+        return
+
+    context.user_data["pending_photo"] = file_id
+    await update.message.reply_text("Photo received. Use /approve or /reject.")
+
+
+# -----------------------------
+# Video Handler (Admins only)
+# -----------------------------
+@admin_only
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global last_video_time, batch_count
+
+    message = update.message
+
     try:
-        await asyncio.sleep(BATCH_TIMEOUT)
-        await flush_album(chat_id, bot)
-    finally:
-        album_timer.pop(chat_id, None)
-
-# ---------------------- MAIN HANDLER ----------------------
-async def clean_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global PHOTO_ACCEPT
-
-    msg = update.effective_message
-    chat_id = msg.chat_id
-
-    # Delete original
-    try:
-        await msg.delete()
-    except Exception:
+        await message.delete()
+    except:
         pass
 
-    file_unique_id = None
-    file_id = None
-    media_type = None
-
-    # ---------------------- VIDEO DETECTION ----------------------
-    if msg.video:
-        file_unique_id = msg.video.file_unique_id
-        file_id = msg.video.file_id
-        media_type = "video"
-        logger.info(f"Detected VIDEO: file_id={file_id}")
-
-    elif msg.document and msg.document.mime_type and msg.document.mime_type.startswith("video"):
-        file_unique_id = msg.document.file_unique_id
-        file_id = msg.document.file_id
-        media_type = "video"
-        logger.info(f"Detected VIDEO-DOC (mime video/*): file_id={file_id}")
-
-    elif msg.document and msg.document.file_name and msg.document.file_name.lower().endswith(".mp4"):
-        file_unique_id = msg.document.file_unique_id
-        file_id = msg.document.file_id
-        media_type = "video"
-        logger.info(f"Detected VIDEO-DOC (.mp4 filename): file_id={file_id}")
-
-    # ---------------------- PHOTO ----------------------
-    elif msg.photo:
-        if not PHOTO_ACCEPT:
-            await safe_send(context.bot.send_message, chat_id, "Photo dropped (disabled).")
-            return
-
-        file_unique_id = msg.photo[-1].file_unique_id
-        file_id = msg.photo[-1].file_id
-        media_type = "photo"
-        logger.info(f"Detected PHOTO: file_id={file_id}")
-
-    # ---------------------- DOCUMENT ----------------------
-    elif msg.document:
-        file_unique_id = msg.document.file_unique_id
-        file_id = msg.document.file_id
-        media_type = "document"
-        logger.info(f"Detected DOCUMENT: file_id={file_id}")
-
-    else:
-        if msg.text:
-            await safe_send(context.bot.send_message, chat_id, msg.text)
+    if not message.video:
         return
 
-    # ---------------------- DEDUP ----------------------
-    if file_unique_id and r.sismember("dedup", file_unique_id):
-        await safe_send(context.bot.send_message, chat_id, "Duplicate ignored.")
+    file_id = message.video.file_id
+
+    if file_id in video_cache:
         return
 
-    if file_unique_id:
-        r.sadd("dedup", file_unique_id)
+    video_cache.add(file_id)
 
-    # ---------------------- VIDEO ALBUM MODE ----------------------
-    if media_type == "video":
-        if chat_id not in album_buffer:
-            album_buffer[chat_id] = []
+    last_video_time = time.time()
+    batch_count += 1
 
-        album_buffer[chat_id].append(file_id)
-        logger.info(f"Added to album: {file_id}. Total now: {len(album_buffer[chat_id])}")
+    await update.message.reply_text(f"Received {batch_count} videos…")
 
-        if len(album_buffer[chat_id]) >= ALBUM_MIN_COUNT:
-            await flush_album(chat_id, context.bot)
+    if "album" not in context.user_data:
+        context.user_data["album"] = []
 
-            if chat_id in album_timer:
-                album_timer[chat_id].cancel()
-                album_timer.pop(chat_id, None)
+    context.user_data["album"].append(file_id)
 
-            return
+    if len(context.user_data["album"]) >= 10:
+        await send_album(update, context)
 
-        if chat_id not in album_timer:
-            album_timer[chat_id] = asyncio.create_task(
-                start_album_timer(chat_id, context.bot)
-            )
 
+# -----------------------------
+# Album Sending
+# -----------------------------
+async def send_album(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    album = context.user_data.get("album", [])
+    if not album:
         return
 
-    # ---------------------- NON-VIDEO MEDIA ----------------------
-    if media_type == "photo":
-        await safe_send(context.bot.send_photo, chat_id, file_id)
+    delay = random.uniform(2, 3)
+    await asyncio.sleep(delay)
 
-    elif media_type == "document":
-        await safe_send(context.bot.send_document, chat_id, file_id)
+    media_group = [InputMediaVideo(media=fid) for fid in album]
 
-# ---------------------- COMMAND: TOGGLE PHOTOS ----------------------
-async def toggle_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global PHOTO_ACCEPT
-    PHOTO_ACCEPT = not PHOTO_ACCEPT
-    status = "ON" if PHOTO_ACCEPT else "OFF"
-    await safe_send(update.message.reply_text, f"Photo acceptance is now {status}.")
+    await update.message.reply_media_group(media_group)
+    context.user_data["album"] = []
 
-# ---------------------- DEBUG COMMAND ----------------------
-async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_send(update.message.reply_text, "Debug mode active. Check Railway logs.")
 
-# ---------------------- MAIN APP ----------------------
-async def main():
-    token = os.getenv("BOT_TOKEN")
-    if not token:
-        raise RuntimeError("BOT_TOKEN environment variable is not set.")
+async def send_album_to_chat(app, chat_id, album):
+    media_group = [InputMediaVideo(media=fid) for fid in album]
+    await app.bot.send_media_group(chat_id, media_group)
 
-    app = ApplicationBuilder().token(token).build()
 
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, clean_forward))
-    app.add_handler(CommandHandler("togglephotos", toggle_photos))
-    app.add_handler(CommandHandler("debug", debug))
+# -----------------------------
+# Batch Watcher (JobQueue)
+# -----------------------------
+async def batch_watcher(app):
+    global last_video_time
 
-    logger.info("Bot starting...")
+    now = time.time()
 
-    await app.initialize()
-    await app.start()
+    for chat_id, data in list(app.chat_data.items()):
+        album = data.get("album", [])
+        if album and now - last_video_time >= FLUSH_TIMEOUT:
+            await app.bot.send_message(chat_id, "Batch ended. Sending remaining videos…")
+            await send_album_to_chat(app, chat_id, album)
+            data["album"] = []
 
-    # Startup message
-    if ADMIN_CHAT_ID:
-        await app.bot.send_message(ADMIN_CHAT_ID, "🚀 Bot is now running!")
 
-    await app.run_polling()
-    await app.stop()
-    await app.shutdown()
+# -----------------------------
+# post_init (Fix for async startup)
+# -----------------------------
+async def post_init(app):
+    commands = [
+        BotCommand("start", "Show your Telegram ID"),
+        BotCommand("help", "Show help menu"),
+        BotCommand("settings", "Show bot settings"),
+        BotCommand("admin_commands", "Show admin commands"),
+        BotCommand("toggle_photo_mode", "Toggle photo approval mode"),
+        BotCommand("approve", "Approve pending photo"),
+        BotCommand("reject", "Reject pending photo"),
+        BotCommand("flush", "Flush remaining videos"),
+    ]
 
-# ---------------------- ENTRYPOINT ----------------------
+    await app.bot.set_my_commands(commands)
+
+    app.job_queue.run_repeating(
+        lambda ctx: asyncio.create_task(batch_watcher(app)),
+        interval=5,
+        first=5
+    )
+
+    logger.info("Post-init tasks completed.")
+
+
+# -----------------------------
+# Main (Railway-safe)
+# -----------------------------
+def main():
+    BOT_TOKEN = os.getenv("BOT_TOKEN")
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN environment variable is missing!")
+
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # Commands
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("settings", settings))
+    app.add_handler(CommandHandler("admin_commands", admin_commands))
+    app.add_handler(CommandHandler("toggle_photo_mode", toggle_photo_mode))
+    app.add_handler(CommandHandler("approve", approve))
+    app.add_handler(CommandHandler("reject", reject))
+    app.add_handler(CommandHandler("flush", flush))
+
+    # Media handlers
+    app.add_handler(MessageHandler(filters.VIDEO, handle_video))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+
+    # Run async startup tasks AFTER loop starts
+    app.post_init = post_init
+
+    logger.info("Bot is now polling...")
+    app.run_polling()
+
+
 if __name__ == "__main__":
-    asyncio.run(main(), debug=False)
+    main()
