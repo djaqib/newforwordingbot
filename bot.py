@@ -72,11 +72,19 @@ async def clean_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_id = None
     media_type = None
 
+    # Normal Telegram video
     if msg.video:
         file_unique_id = msg.video.file_unique_id
         file_id = msg.video.file_id
         media_type = "video"
 
+    # iPhone MP4 or forwarded MP4 (video sent as document)
+    elif msg.document and msg.document.mime_type and msg.document.mime_type.startswith("video"):
+        file_unique_id = msg.document.file_unique_id
+        file_id = msg.document.file_id
+        media_type = "video"
+
+    # Photo
     elif msg.photo:
         if not PHOTO_ACCEPT:
             await context.bot.send_message(chat_id, "Photo dropped (disabled).")
@@ -86,6 +94,7 @@ async def clean_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_id = msg.photo[-1].file_id
         media_type = "photo"
 
+    # Document (non-video)
     elif msg.document:
         file_unique_id = msg.document.file_unique_id
         file_id = msg.document.file_id
