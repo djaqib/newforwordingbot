@@ -6,6 +6,7 @@ from telegram import Update, InputMediaVideo
 from telegram.ext import (
     ApplicationBuilder,
     MessageHandler,
+    CommandHandler,
     ContextTypes,
     filters
 )
@@ -16,55 +17,60 @@ logging.basicConfig(
     level=logging.INFO
 )
 
+logger = logging.getLogger(__name__)
+
 # ---------------------- REDIS (Persistent Dedup) ----------------------
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 r = redis.Redis.from_url(REDIS_URL)
 
 # ---------------------- SETTINGS ----------------------
-PHOTO_ACCEPT = True  # toggle ON/OFF
-BATCH_TIMEOUT = 120  # seconds
+PHOTO_ACCEPT = True          # toggle ON/OFF for photos
+BATCH_TIMEOUT = 120          # seconds for video batch timeout
+ALBUM_MIN_COUNT = 10         # send album when >= 10 videos
 
 # ---------------------- ALBUM BUFFER + TIMER ----------------------
-album_buffer = {}      # chat_id → list of file paths
-album_timer = {}       # chat_id → asyncio.Task
+album_buffer = {}            # chat_id -> list of file paths
+album_timer = {}             # chat_id -> asyncio.Task
 
 
-# ---------------------- SEND ALBUM ----------------------
-async def flush_album(chat_id, bot):
+# ---------------------- FLUSH ALBUM ----------------------
+async def flush_album(chat_id: int, bot):
     """Send album for a chat_id and clear buffer."""
     if chat_id not in album_buffer or len(album_buffer[chat_id]) == 0:
         return
 
-    media_group = [
-        InputMediaVideo(open(fp, "rb"))
-        for fp in album_buffer[chat_id]
-    ]
+    media_group = []
+    for fp in album_buffer[chat_id]:
+        try:
+            f = open(fp, "rb")
+            media_group.append(InputMediaVideo(f))
+        except Exception as e:
+            logger.error(f"Error opening file {fp}: {e}")
 
-    await bot.send_media_group(chat_id, media_group)
+    if media_group:
+        await bot.send_media_group(chat_id=chat_id, media=media_group)
 
     # Cleanup files
     for fp in album_buffer[chat_id]:
         try:
             os.remove(fp)
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"Error removing file {fp}: {e}")
 
     album_buffer[chat_id] = []
 
 
-# ---------------------- START TIMER ----------------------
-async def start_album_timer(chat_id, bot):
-    """Start a 120-second timer for album flush."""
-    await asyncio.sleep(BATCH_TIMEOUT)
-
-    # Timer expired → flush album
-    await flush_album(chat_id, bot)
-
-    # Remove timer reference
-    album_timer.pop(chat_id, None)
+# ---------------------- START ALBUM TIMER ----------------------
+async def start_album_timer(chat_id: int, bot):
+    """Start a BATCH_TIMEOUT-second timer for album flush."""
+    try:
+        await asyncio.sleep(BATCH_TIMEOUT)
+        await flush_album(chat_id, bot)
+    finally:
+        album_timer.pop(chat_id, None)
 
 
-# ---------------------- CLEAN FORWARD ----------------------
+# ---------------------- MAIN HANDLER ----------------------
 async def clean_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global PHOTO_ACCEPT
 
@@ -74,8 +80,8 @@ async def clean_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ---------------------- AUTO DELETE ORIGINAL ----------------------
     try:
         await msg.delete()
-    except:
-        pass
+    except Exception as e:
+        logger.debug(f"Could not delete original message: {e}")
 
     # ---------------------- MEDIA DETECTION ----------------------
     file_unique_id = None
@@ -102,30 +108,37 @@ async def clean_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
         media_type = "document"
 
     else:
+        # Text or other non-media → send clean text
         if msg.text:
             await context.bot.send_message(chat_id, msg.text)
         return
 
     # ---------------------- DEDUP CHECK (Redis) ----------------------
-    if r.sismember("dedup", file_unique_id):
+    if file_unique_id and r.sismember("dedup", file_unique_id):
         await context.bot.send_message(chat_id, "Duplicate ignored.")
         return
 
-    r.sadd("dedup", file_unique_id)
+    if file_unique_id:
+        r.sadd("dedup", file_unique_id)
 
     # ---------------------- DOWNLOAD FILE ----------------------
-    file_path = f"temp_{file_unique_id}.bin"
-    await file_obj.get_file().download_to_drive(file_path)
+    file_path = f"temp_{file_unique_id}.bin" if file_unique_id else "temp.bin"
+    try:
+        await file_obj.get_file().download_to_drive(file_path)
+    except Exception as e:
+        logger.error(f"Error downloading file: {e}")
+        await context.bot.send_message(chat_id, "Error processing file.")
+        return
 
-    # ---------------------- ALBUM MODE FOR VIDEOS ----------------------
+    # ---------------------- VIDEO: ALBUM MODE ----------------------
     if media_type == "video":
         if chat_id not in album_buffer:
             album_buffer[chat_id] = []
 
         album_buffer[chat_id].append(file_path)
 
-        # If 10+ videos → send immediately
-        if len(album_buffer[chat_id]) >= 10:
+        # If >= ALBUM_MIN_COUNT videos → send immediately
+        if len(album_buffer[chat_id]) >= ALBUM_MIN_COUNT:
             await flush_album(chat_id, context.bot)
 
             # Cancel timer if running
@@ -135,7 +148,7 @@ async def clean_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             return
 
-        # If <10 videos → start timer if not running
+        # If < ALBUM_MIN_COUNT → start timer if not running
         if chat_id not in album_timer:
             album_timer[chat_id] = asyncio.create_task(
                 start_album_timer(chat_id, context.bot)
@@ -144,19 +157,22 @@ async def clean_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ---------------------- NON-VIDEO MEDIA ----------------------
-    if media_type == "photo":
-        await context.bot.send_photo(chat_id, open(file_path, "rb"))
-
-    elif media_type == "document":
-        await context.bot.send_document(chat_id, open(file_path, "rb"))
-
     try:
-        os.remove(file_path)
-    except:
-        pass
+        if media_type == "photo":
+            with open(file_path, "rb") as f:
+                await context.bot.send_photo(chat_id, f)
+
+        elif media_type == "document":
+            with open(file_path, "rb") as f:
+                await context.bot.send_document(chat_id, f)
+    finally:
+        try:
+            os.remove(file_path)
+        except Exception as e:
+            logger.error(f"Error removing file {file_path}: {e}")
 
 
-# ---------------------- COMMANDS ----------------------
+# ---------------------- COMMAND: TOGGLE PHOTOS ----------------------
 async def toggle_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global PHOTO_ACCEPT
     PHOTO_ACCEPT = not PHOTO_ACCEPT
@@ -164,19 +180,21 @@ async def toggle_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Photo acceptance is now {status}.")
 
 
-# ---------------------- MAIN ----------------------
+# ---------------------- MAIN APP ----------------------
 async def main():
-    TOKEN = os.getenv("BOT_TOKEN")
+    token = os.getenv("BOT_TOKEN")
+    if not token:
+        raise RuntimeError("BOT_TOKEN environment variable is not set.")
 
-    app = ApplicationBuilder().token(TOKEN).build()
+    app = ApplicationBuilder().token(token).build()
 
-    app.add_handler(MessageHandler(filters.ALL, clean_forward))
-    app.add_handler(MessageHandler(filters.Command("togglephotos"), toggle_photos))
+    # Handlers
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, clean_forward))
+    app.add_handler(CommandHandler("togglephotos", toggle_photos))
 
-    print("Bot running...")
+    logger.info("Bot starting...")
     await app.run_polling()
 
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())
