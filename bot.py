@@ -23,13 +23,13 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 r = redis.Redis.from_url(REDIS_URL)
 
 # ---------------------- SETTINGS ----------------------
-PHOTO_ACCEPT = True          # toggle ON/OFF for photos
-BATCH_TIMEOUT = 120          # seconds for video batch timeout
-ALBUM_MIN_COUNT = 10         # send album when >= 10 videos
+PHOTO_ACCEPT = True
+BATCH_TIMEOUT = 120
+ALBUM_MIN_COUNT = 10
 
 # ---------------------- ALBUM BUFFER + TIMER ----------------------
-album_buffer = {}            # chat_id -> list of file paths
-album_timer = {}             # chat_id -> asyncio.Task
+album_buffer = {}      # chat_id → list of file paths
+album_timer = {}       # chat_id → asyncio.Task
 
 
 # ---------------------- FLUSH ALBUM ----------------------
@@ -44,7 +44,7 @@ async def flush_album(chat_id: int, bot):
             f = open(fp, "rb")
             media_group.append(InputMediaVideo(f))
         except Exception as e:
-            logger.error(f"Error opening file %s: %s", fp, e)
+            logger.error(f"Error opening file {fp}: {e}")
 
     if media_group:
         await bot.send_media_group(chat_id=chat_id, media=media_group)
@@ -54,7 +54,7 @@ async def flush_album(chat_id: int, bot):
         try:
             os.remove(fp)
         except Exception as e:
-            logger.error(f"Error removing file %s: %s", fp, e)
+            logger.error(f"Error removing file {fp}: {e}")
 
     album_buffer[chat_id] = []
 
@@ -80,7 +80,7 @@ async def clean_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await msg.delete()
     except Exception as e:
-        logger.debug("Could not delete original message: %s", e)
+        logger.debug(f"Could not delete original message: {e}")
 
     # ---------------------- MEDIA DETECTION ----------------------
     file_unique_id = None
@@ -120,11 +120,11 @@ async def clean_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
         r.sadd("dedup", file_unique_id)
 
     # ---------------------- DOWNLOAD FILE ----------------------
-    file_path = f"temp_{file_unique_id}.bin" if file_unique_id else "temp.bin"
+    file_path = f"temp_{file_unique_id}.bin"
     try:
         await file_obj.get_file().download_to_drive(file_path)
     except Exception as e:
-        logger.error("Error downloading file: %s", e)
+        logger.error(f"Error downloading file: {e}")
         await context.bot.send_message(chat_id, "Error processing file.")
         return
 
@@ -167,7 +167,7 @@ async def clean_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             os.remove(file_path)
         except Exception as e:
-            logger.error("Error removing file %s: %s", file_path, e)
+            logger.error(f"Error removing file {file_path}: {e}")
 
 
 # ---------------------- COMMAND: TOGGLE PHOTOS ----------------------
@@ -178,7 +178,7 @@ async def toggle_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Photo acceptance is now {status}.")
 
 
-# ---------------------- MAIN APP (PTB async startup) ----------------------
+# ---------------------- MAIN APP (PTB lifecycle with shutdown fix) ----------------------
 async def main():
     token = os.getenv("BOT_TOKEN")
     if not token:
@@ -194,11 +194,14 @@ async def main():
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
-    await app.updater.idle()
+
+    try:
+        await app.updater.idle()
+    finally:
+        await app.stop()
+        await app.shutdown()
 
 
 # ---------------------- EVENT LOOP (Railway-safe) ----------------------
 if __name__ == "__main__":
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(main())
+    asyncio.run(main(), debug=False)
