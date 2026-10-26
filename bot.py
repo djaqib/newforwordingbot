@@ -3,18 +3,33 @@ import logging
 import asyncio
 import random
 import time
+from dotenv import load_dotenv  # 1. Import it first
+
+# 2. Now call it to load the .env file
+load_dotenv()
+
 from telegram import Update, InputMediaVideo, BotCommand
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     ContextTypes, filters
 )
 
+# -----------------------------
+# Logging
+# -----------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.FileHandler("bot.log"), logging.StreamHandler()]
+    handlers=[
+        logging.FileHandler("bot.log"),
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
+
+# -----------------------------
+# Admin IDs (ONLY these users can use bot)
+# -----------------------------
 
 ADMIN_IDS = [
     7599601301,
