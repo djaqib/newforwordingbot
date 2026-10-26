@@ -4,7 +4,12 @@ import logging
 import os
 import random
 import sqlite3
+import random
 import time
+from dotenv import load_dotenv  # 1. Import it first
+
+# 2. Now call it to load the .env file
+load_dotenv()
 
 from telegram import (
     BotCommand, InlineKeyboardButton, InlineKeyboardMarkup,
