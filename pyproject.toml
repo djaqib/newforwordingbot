@@ -1,2 +1,2 @@
 [tool.vercel]
-entrypoint = "bot.py"
+entrypoint = "main.py"
