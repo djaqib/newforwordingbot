@@ -7,7 +7,25 @@ import sqlite3
 import random
 import time
 from dotenv import load_dotenv  # 1. Import it first
+from threading import Thread
+from flask import Flask
 
+health_app = Flask(__name__)
+
+@health_app.get("/")
+@health_app.get("/health")
+def health():
+    return "Bot is running", 200
+
+def run_health_server():
+    port = int(os.environ.get("PORT", "10000"))
+    health_app.run(
+        host="0.0.0.0",
+        port=port,
+        use_reloader=False
+    )
+
+Thread(target=run_health_server, daemon=True).start()
 # 2. Now call it to load the .env file
 load_dotenv()
 
@@ -34,9 +52,6 @@ os.makedirs(DATA_DIR, exist_ok=True)
 _env_ids = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS = {int(x) for x in _env_ids.replace(" ", "").split(",") if x.isdigit()} or {
     7599601301,  # KR
-    8637601933,
-    8976017144,
-    7467197752,
 }
 
 # Per-user setting defaults (the type of the default decides how it's parsed)
